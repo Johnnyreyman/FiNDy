@@ -24,8 +24,8 @@ The easiest way to get FiNDy running is to use the provided installation script,
 2. **Open a terminal** in the project directory.
 3. **Run the installer**:
    ```bash
-   chmod +x install_tk.sh
-   ./install_tk.sh
+   chmod +x install.sh
+   ./install.sh
 
 ```
 
