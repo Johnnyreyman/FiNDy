@@ -133,7 +133,6 @@ If the auto-detection fails to match your preference, you can modify the `detect
 
 * ✅ **No heavy Qt dependencies** - Small footprint.
 * ✅ **Automatic theme matching** - Adapts to KDE or GNOME.
-* ✅ **Cross-platform** - Portable across Linux distributions.
 * ✅ **Modern look** - High-quality themes via `ttkbootstrap`.
 
 ## Contributing
