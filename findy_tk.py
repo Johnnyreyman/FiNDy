@@ -514,7 +514,7 @@ class UpdateWindow(Toplevel):
         for widget in self.winfo_children():
             if isinstance(widget, ttk.Frame):
                 for child in widget.winfo_children():
-                    if isinstance(child, tttk.Button):
+                    if isinstance(child, ttk.Button):
                         child.config(state=DISABLED)
 
         threading.Thread(
@@ -1652,10 +1652,7 @@ class FiNDyApp(ttk.Window):
         # --------------- tray icon + initial update check -----------------
         self.tray_manager = None
         if TRAY_AVAILABLE:
-            try:
-                self.tray_manager = TrayManager(self, self.settings)
-            except Exception as e:
-                print(f"Tray icon failed to start: {e}")
+            self.tray_manager = TrayManager(self, self.settings)
 
         # Kick off the very first update check (result → show_update_dialog)
         UpdateChecker(self._on_startup_check).start()
@@ -1758,5 +1755,4 @@ class FiNDyApp(ttk.Window):
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    app = FiNDyApp()
-    app.mainloop()
+    FiNDyApp().mainloop()
