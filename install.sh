@@ -23,10 +23,10 @@ fi
 
 echo "Checking for Tkinter..."
 if ! python3 -c "import tkinter" 2>/dev/null; then
-    echo "Installing python3-tkinter..."
-    sudo dnf install -y python3-tkinter || {
+    echo "Installing tkinter..."
+    sudo dnf install -y tkinter || {
         echo "Failed to install Tkinter. Please install it manually:"
-        echo "    sudo dnf install python3-tkinter"
+        echo "    sudo dnf install tkinter"
         exit 1
     }
 fi
