@@ -149,20 +149,6 @@ else
     fi
 fi
 
-# Offer to restart Plasma shell (non-destructive)
-echo ""
-read -r -p "Restart Plasma now to ensure menu shows? (recommended) [Y/n] " restart_ans
-case "${restart_ans:-Y}" in
-    [Yy]*|"")
-        if command -v plasmashell &>/dev/null; then
-            kquitapp6 plasmashell 2>/dev/null && kstart6 plasmashell 2>/dev/null && echo "Plasma restarted."
-        else
-            echo "plasmashell not found — skipping restart."
-        fi
-        ;;
-    *) echo "Skipping Plasma restart." ;;
-esac
-
 # ─────────────────────────────────────────────
 # Final instructions
 # ─────────────────────────────────────────────
