@@ -23,10 +23,12 @@ fi
 
 echo "Checking for Tkinter..."
 if ! python3 -c "import tkinter" 2>/dev/null; then
-    echo "Installing tkinter..."
+    echo "Tkinter not found → installing package 'tkinter'..."
     sudo dnf install -y tkinter || {
-        echo "Failed to install Tkinter. Please install it manually:"
+        echo "Failed to install the 'tkinter' package."
+        echo "Please install it manually:"
         echo "    sudo dnf install tkinter"
+        echo "(or search with: dnf search tkinter)"
         exit 1
     }
 fi
@@ -74,27 +76,28 @@ flatpak update --appstream --assumeyes >/dev/null 2>&1 || true
 # ─────────────────────────────────────────────
 
 echo ""
-echo "GearLever is a excellent tool for managing AppImages"
+echo "GearLever is an excellent tool for managing AppImages"
 echo "(integrate, update, remove, desktop integration, etc.)"
-echo "FiNDy can use it — highly recommended."
+echo "FiNDy works best with it — highly recommended."
 echo ""
 
 while true; do
-    read -r -p "Would you like to install GearLever from Flathub now? [Y/n] " answer
+    read -r -p "Install GearLever from Flathub now? [Y/n] " answer
     case "${answer:-Y}" in
         [Yy]*|"")
             echo "Installing GearLever (flatpak)..."
             flatpak install -y flathub it.mijorus.gearlever && {
                 echo "✓ GearLever installed successfully"
             } || {
-                echo "⚠ GearLever installation failed — you can install it later with:"
+                echo "⚠ GearLever installation failed — install later with:"
                 echo "   flatpak install flathub it.mijorus.gearlever"
             }
             break
             ;;
         [Nn]*)
-            echo "Skipping GearLever installation."
-            echo "You can install it later if you want better AppImage support."
+            echo "Skipping GearLever."
+            echo "You can install it anytime for full AppImage support:"
+            echo "   flatpak install flathub it.mijorus.gearlever"
             break
             ;;
         *)
@@ -122,9 +125,12 @@ MAIN_SCRIPT="$SCRIPT_DIR/findy_tk.py"
 
 if [[ ! -f "$MAIN_SCRIPT" ]]; then
     echo "Error: findy_tk.py not found in current directory!"
-    echo "Please run this installer from the same folder as findy_tk.py"
+    echo "Please cd into the folder containing findy_tk.py and run this script again."
     exit 1
 fi
+
+# Ensure absolute path for reliability
+ABS_SCRIPT="$(realpath "$MAIN_SCRIPT")"
 
 echo ""
 echo "Making findy_tk.py executable..."
@@ -133,21 +139,30 @@ chmod +x "$MAIN_SCRIPT"
 echo "Creating desktop entry..."
 mkdir -p ~/.local/share/applications
 
-cat > ~/.local/share/applications/findy-package-manager.desktop << EOF
+DESKTOP_FILE=~/.local/share/applications/findy-package-manager.desktop
+
+cat > "$DESKTOP_FILE" << EOF
 [Desktop Entry]
 Type=Application
 Name=FiNDy Package Manager
-Comment=Fast package management for DNF • Flatpak • AppImages
-Exec=python3 $MAIN_SCRIPT
+Comment=Fast package management for DNF • Flatpak • AppImages (OpenMandriva)
+Exec=python3 $ABS_SCRIPT
 Icon=system-software-install
 Terminal=false
 Categories=System;Settings;PackageManager;
 StartupNotify=true
 EOF
 
-chmod +x ~/.local/share/applications/findy-package-manager.desktop
+chmod +x "$DESKTOP_FILE"
 
+# Refresh desktop database (helps KDE Plasma, LXQt, etc. see the new entry)
+echo "Refreshing desktop menu cache..."
 update-desktop-database ~/.local/share/applications 2>/dev/null || true
+
+# Optional: try to restart KDE plasmashell if running Plasma (harmless if not)
+if command -v plasmashell &>/dev/null; then
+    kquitapp5 plasmashell && kstart5 plasmashell >/dev/null 2>&1 || true
+fi
 
 # ─────────────────────────────────────────────
 #  Final message
@@ -158,13 +173,18 @@ echo "======================================="
 echo "         Installation complete!        "
 echo "======================================="
 echo ""
-echo "You can now start FiNDy in these ways:"
-echo "  • From menu / application launcher → search for 'FiNDy'"
-echo "  • From terminal:    python3 $(realpath findy_tk.py)"
+echo "FiNDy should now appear in your application menu as 'FiNDy Package Manager'."
 echo ""
-echo "Tip: if GearLever was installed, AppImage support will be much better."
-echo "     If not — you can still install it anytime:"
-echo "         flatpak install flathub it.mijorus.gearlever"
+echo "Quick start options:"
+echo "  • Menu / launcher → search for 'FiNDy' or 'Package Manager'"
+echo "  • Terminal:         python3 \"$ABS_SCRIPT\""
 echo ""
-echo "Enjoy using FiNDy on OpenMandriva!"
+echo "If it doesn't show up right away:"
+echo "  • Run: update-desktop-database ~/.local/share/applications"
+echo "  • Or log out and back in (or restart your session)"
+echo "  • In KDE Plasma: sometimes right-click menu → 'Refresh Desktop' or restart plasmashell helps"
+echo ""
+echo "GearLever (if installed) will give the best AppImage experience."
+echo ""
+echo "Enjoy FiNDy on OpenMandriva!"
 echo ""
