@@ -185,6 +185,113 @@ def refresh_repos():
 _ARCH_RE = re.compile(r'\.(x86_64|i686|noarch|aarch64|armv7hl|src)$')
 
 # ---------------------------------------------------------------------------
+# DNF search via repoquery (reliable on DNF4 and DNF5 / OpenMandriva)
+# ---------------------------------------------------------------------------
+def dnf_search(query: str) -> list[dict]:
+    """
+    Use `dnf repoquery` with queryformat for reliable structured output.
+    Falls back to a plain text parse of `dnf search` if repoquery fails.
+    Returns list of dicts: {name, version, release, arch, repo, summary}
+    """
+    # --- primary: repoquery with explicit queryformat ---
+    try:
+        qf = "%{name}\t%{version}-%{release}\t%{repoid}\t%{summary}"
+        r = subprocess.run(
+            ["dnf", "repoquery", "--queryformat", qf,
+             "--available", "--arch", "x86_64,noarch",
+             f"*{query}*"],
+            capture_output=True, text=True, timeout=60
+        )
+        results = []
+        seen = set()
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith(("Last metadata", "Modular")):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            name    = parts[0].strip()
+            version = parts[1].strip() if len(parts) > 1 else ""
+            repo    = parts[2].strip() if len(parts) > 2 else ""
+            summary = parts[3].strip() if len(parts) > 3 else ""
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            results.append({"name": name, "version": version,
+                             "repo": repo, "summary": summary})
+        if results:
+            return results
+    except Exception:
+        pass
+
+    # --- fallback: also try installed packages matching the query ---
+    try:
+        qf = "%{name}\t%{version}-%{release}\t%{repoid}\t%{summary}"
+        r = subprocess.run(
+            ["dnf", "repoquery", "--queryformat", qf,
+             "--installed", f"*{query}*"],
+            capture_output=True, text=True, timeout=60
+        )
+        results = []
+        seen = set()
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith(("Last metadata", "Modular")):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            name    = parts[0].strip()
+            version = parts[1].strip() if len(parts) > 1 else ""
+            repo    = parts[2].strip() if len(parts) > 2 else ""
+            summary = parts[3].strip() if len(parts) > 3 else ""
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            results.append({"name": name, "version": version,
+                             "repo": repo, "summary": summary})
+        if results:
+            return results
+    except Exception:
+        pass
+
+    # --- last resort: parse `dnf search` free-text output ---
+    try:
+        r = subprocess.run(["dnf", "search", "--", query],
+                           capture_output=True, text=True, timeout=60)
+        combined = r.stdout + r.stderr
+        results = []
+        seen = set()
+        for line in combined.splitlines():
+            # DNF5 compact format: one or more whitespace-separated tokens,
+            # last meaningful token before trailing text is name.arch
+            # Try the classic "name.arch : summary" format first
+            m = re.match(r'^([A-Za-z0-9][A-Za-z0-9+\-._]*(?:\.[a-z0-9_]+)?)\s{2,}(.+)$', line)
+            if not m:
+                m = re.match(r'^([A-Za-z0-9][A-Za-z0-9+\-._]*(?:\.[a-z0-9_]+)?)\s+:\s+(.+)$', line)
+            if not m:
+                continue
+            raw_name = m.group(1).strip()
+            summary  = m.group(2).strip()
+            # Must look like a package name
+            if not re.match(r'^[A-Za-z0-9][A-Za-z0-9+\-._]*$', raw_name):
+                continue
+            # Skip obvious non-package tokens
+            if raw_name.lower() in ("matched", "name", "summary", "warning",
+                                    "error", "fields", "exact"):
+                continue
+            name = _ARCH_RE.sub('', raw_name)
+            if name in seen:
+                continue
+            seen.add(name)
+            results.append({"name": name, "version": "", "repo": "", "summary": summary})
+        return results
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Background update checker
 # ---------------------------------------------------------------------------
 class UpdateChecker(threading.Thread):
@@ -362,45 +469,22 @@ class DNFTab(ttk.Frame):
 
     def _do_search(self, query):
         try:
-            r = subprocess.run(
-                ["dnf", "search", query],
-                capture_output=True, text=True, timeout=60
-            )
-            combined = r.stdout + ("\n" + r.stderr if r.stderr.strip() else "")
-            self.after(0, lambda: self._parse_search(combined))
+            results = dnf_search(query)
+            self.after(0, lambda: self._show_search_results(results, query))
         except Exception as e:
             self.after(0, lambda: messagebox.showerror("Search Error", str(e)))
 
-    def _parse_search(self, output):
+    def _show_search_results(self, results: list[dict], query: str):
         self.main_app.stop_progress()
         for item in self.tree.get_children():
             self.tree.delete(item)
-
-        count = 0
-        for line in output.splitlines():
-            if not line.strip():
-                continue
-            if re.match(r'^\s*[=\-]+\s', line):
-                continue
-            if line.strip().lower().startswith(('last metadata', 'matched fields',
-                                                'warning:', 'error:')):
-                continue
-            m = re.match(r'^(\S+)\s+:\s+(.*)', line)
-            if not m:
-                continue
-            raw_name = m.group(1).strip()
-            summary  = m.group(2).strip()
-            if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9+\-._]*$', raw_name):
-                continue
-            name = _ARCH_RE.sub('', raw_name)
-            self.tree.insert("", END, values=(name, "", "", summary))
-            count += 1
-
-        self.status_var.set(f"Found {count} result(s).")
-        if count == 0 and output.strip():
-            preview = output.strip()[:800]
-            messagebox.showinfo("Debug – Raw DNF Output",
-                f"No results parsed. Raw output preview:\n\n{preview}")
+        for pkg in results:
+            self.tree.insert("", END, values=(
+                pkg["name"], pkg.get("version", ""),
+                pkg.get("repo", ""), pkg.get("summary", "")))
+        count = len(results)
+        self.status_var.set(f"Found {count} result(s) for '{query}'."
+                            if count else f"No results found for '{query}'.")
 
     def list_all(self):
         self.status_var.set("Listing all packages…")
@@ -683,7 +767,6 @@ class FlatpakTab(ttk.Frame):
         ttk.Button(btn_frame, text="Cancel", command=dlg.destroy,
                    bootstyle="outline-secondary", width=12).pack(side=LEFT, padx=8)
 
-        # Size the dialog after all widgets are packed
         dlg.update_idletasks()
         dlg.minsize(dlg.winfo_reqwidth() + 20, dlg.winfo_reqheight() + 10)
 
