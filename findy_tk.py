@@ -185,6 +185,56 @@ def refresh_repos():
 _ARCH_RE = re.compile(r'\.(x86_64|i686|noarch|aarch64|armv7hl|src)$')
 
 # ---------------------------------------------------------------------------
+# Privilege escalation helper
+# ---------------------------------------------------------------------------
+def _build_priv_cmd(dnf_args: list[str]) -> list[str]:
+    """
+    Return a command list that runs DNF with root privileges.
+
+    Priority:
+      1. pkexec  — preferred (GUI polkit agent, no TTY needed when agent is running)
+      2. kdesu   — KDE su wrapper
+      3. kdesudo — older KDE
+      4. gksudo  — GTK
+      5. xterm -e sudo — last-resort TTY in a throwaway terminal
+
+    The TTY error seen in the screenshot happens when pkexec falls back to its
+    *textual* authentication agent because no graphical polkit agent is running.
+    We work around this by trying GUI wrappers first and, if all else fails,
+    opening a small xterm so sudo has a real TTY.
+    """
+    base = ["dnf"] + dnf_args
+
+    # 1. pkexec — works when a graphical polkit agent (e.g. polkit-gnome,
+    #    lxqt-policykit, polkit-kde-agent) is running in the session.
+    if _cmd_exists("pkexec"):
+        return ["pkexec"] + base
+
+    # 2. kdesu / kdesudo
+    for wrapper in ("kdesu", "kdesudo"):
+        if _cmd_exists(wrapper):
+            return [wrapper, "-c", " ".join(base)]
+
+    # 3. gksudo / gksu
+    for wrapper in ("gksudo", "gksu"):
+        if _cmd_exists(wrapper):
+            return [wrapper, "--"] + base
+
+    # 4. xterm + sudo as last resort (gives sudo a real TTY)
+    if _cmd_exists("xterm") and _cmd_exists("sudo"):
+        return ["xterm", "-e", "sudo"] + base
+
+    # 5. Bare sudo — will fail without a TTY but at least gives a clear error
+    return ["sudo"] + base
+
+
+def _cmd_exists(name: str) -> bool:
+    """Return True if `name` is found on PATH."""
+    import shutil
+    return shutil.which(name) is not None
+
+
+# ---------------------------------------------------------------------------
 # DNF search via repoquery (reliable on DNF4 and DNF5 / OpenMandriva)
 # ---------------------------------------------------------------------------
 def dnf_search(query: str) -> list[dict]:
@@ -264,9 +314,6 @@ def dnf_search(query: str) -> list[dict]:
         results = []
         seen = set()
         for line in combined.splitlines():
-            # DNF5 compact format: one or more whitespace-separated tokens,
-            # last meaningful token before trailing text is name.arch
-            # Try the classic "name.arch : summary" format first
             m = re.match(r'^([A-Za-z0-9][A-Za-z0-9+\-._]*(?:\.[a-z0-9_]+)?)\s{2,}(.+)$', line)
             if not m:
                 m = re.match(r'^([A-Za-z0-9][A-Za-z0-9+\-._]*(?:\.[a-z0-9_]+)?)\s+:\s+(.+)$', line)
@@ -274,10 +321,8 @@ def dnf_search(query: str) -> list[dict]:
                 continue
             raw_name = m.group(1).strip()
             summary  = m.group(2).strip()
-            # Must look like a package name
             if not re.match(r'^[A-Za-z0-9][A-Za-z0-9+\-._]*$', raw_name):
                 continue
-            # Skip obvious non-package tokens
             if raw_name.lower() in ("matched", "name", "summary", "warning",
                                     "error", "fields", "exact"):
                 continue
@@ -344,16 +389,48 @@ class PackageWorker(threading.Thread):
             self.callback(False, str(e))
 
     def _run_dnf(self):
-        cmd_map = {
-            "install": ["pkexec", "dnf", "install", "-y", self.package_name],
-            "remove":  ["pkexec", "dnf", "remove",  "-y", self.package_name],
-            "update":  ["pkexec", "dnf", "upgrade", "-y"],
+        dnf_args_map = {
+            "install": ["install", "-y", self.package_name],
+            "remove":  ["remove",  "-y", self.package_name],
+            "update":  ["upgrade", "-y"],
         }
-        cmd = cmd_map.get(self.operation)
-        if not cmd:
-            self.callback(False, f"Unknown DNF operation: {self.operation}"); return
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        self.callback(r.returncode == 0, r.stdout if r.returncode == 0 else r.stderr or r.stdout)
+        dnf_args = dnf_args_map.get(self.operation)
+        if not dnf_args:
+            self.callback(False, f"Unknown DNF operation: {self.operation}")
+            return
+
+        cmd = _build_priv_cmd(dnf_args)
+
+        try:
+            r = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                # Ensure no inherited TTY confuses pkexec/sudo
+                stdin=subprocess.DEVNULL,
+            )
+            if r.returncode == 0:
+                self.callback(True, r.stdout)
+            else:
+                # If pkexec failed with the TTY error, give a helpful hint
+                err = r.stderr or r.stdout
+                if "dev/tty" in err or "authentication agent" in err.lower():
+                    err += (
+                        "\n\n— Hint —\n"
+                        "A graphical Polkit authentication agent is required.\n"
+                        "Make sure one of these is running in your session:\n"
+                        "  • polkit-gnome-authentication-agent-1\n"
+                        "  • lxqt-policykit-agent\n"
+                        "  • /usr/lib/polkit-kde-authentication-agent-1\n\n"
+                        "You can start it temporarily by running one of the above "
+                        "commands in a terminal before using FiNDy."
+                    )
+                self.callback(False, err)
+        except FileNotFoundError:
+            self.callback(False, f"Command not found: {cmd[0]}\n\nIs pkexec / sudo installed?")
+        except subprocess.TimeoutExpired:
+            self.callback(False, "Operation timed out after 5 minutes.")
 
     def _run_flatpak(self):
         app_id = self.package_name
