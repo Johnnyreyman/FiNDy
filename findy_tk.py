@@ -13,6 +13,7 @@ import threading
 import re
 import json
 import time
+import shutil
 from tkinter import *
 from tkinter import ttk, messagebox, filedialog
 import ttkbootstrap as ttk
@@ -185,53 +186,93 @@ def refresh_repos():
 _ARCH_RE = re.compile(r'\.(x86_64|i686|noarch|aarch64|armv7hl|src)$')
 
 # ---------------------------------------------------------------------------
-# Privilege escalation helper
+# Polkit agent management
 # ---------------------------------------------------------------------------
+
+# Candidate graphical polkit agents, in preference order.
+# Each entry is the executable name as it appears on PATH.
+_POLKIT_AGENTS = [
+    # OpenMandriva / LXQt
+    "lxqt-policykit-agent",
+    # GNOME / generic
+    "polkit-gnome-authentication-agent-1",
+    "/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1",
+    "/usr/libexec/polkit-gnome-authentication-agent-1",
+    # KDE
+    "/usr/lib/polkit-kde-authentication-agent-1",
+    "/usr/libexec/polkit-kde-authentication-agent-1",
+    "polkit-kde-authentication-agent-1",
+    # XFCE
+    "/usr/lib/xfce4/polkit-xfce-authentication-agent-1",
+    # MATE
+    "/usr/lib/mate-polkit/polkit-mate-authentication-agent-1",
+]
+
+_polkit_proc: subprocess.Popen | None = None  # our own spawned agent, if any
+
+
+def _polkit_agent_running() -> bool:
+    """Return True if any known polkit agent process is already running."""
+    agent_basenames = {
+        "lxqt-policykit-agent",
+        "polkit-gnome-authentication-agent-1",
+        "polkit-kde-authentication-agent-1",
+        "polkit-mate-authentication-agent-1",
+        "polkit-xfce-authentication-agent-1",
+        "xfce-polkit",
+    }
+    try:
+        out = subprocess.run(
+            ["ps", "-e", "-o", "comm="],
+            capture_output=True, text=True, timeout=5
+        ).stdout
+        running = {line.strip() for line in out.splitlines()}
+        return bool(running & agent_basenames)
+    except Exception:
+        return False
+
+
+def ensure_polkit_agent() -> bool:
+    """
+    Make sure a graphical polkit agent is running.
+    If one is already running, do nothing and return True.
+    Otherwise try to launch one from _POLKIT_AGENTS.
+    Returns True if an agent is (or was) successfully started.
+    """
+    global _polkit_proc
+
+    # Already running externally?
+    if _polkit_agent_running():
+        return True
+
+    # Our own spawned agent still alive?
+    if _polkit_proc is not None and _polkit_proc.poll() is None:
+        return True
+
+    # Try to start one
+    for agent in _POLKIT_AGENTS:
+        exe = agent if os.path.isabs(agent) else shutil.which(agent)
+        if not exe or not os.path.isfile(exe):
+            continue
+        try:
+            _polkit_proc = subprocess.Popen(
+                [exe],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            time.sleep(0.6)   # give the agent a moment to register on D-Bus
+            return True
+        except Exception:
+            continue
+
+    return False  # nothing worked
+
+
 def _build_priv_cmd(dnf_args: list[str]) -> list[str]:
-    """
-    Return a command list that runs DNF with root privileges.
-
-    Priority:
-      1. pkexec  — preferred (GUI polkit agent, no TTY needed when agent is running)
-      2. kdesu   — KDE su wrapper
-      3. kdesudo — older KDE
-      4. gksudo  — GTK
-      5. xterm -e sudo — last-resort TTY in a throwaway terminal
-
-    The TTY error seen in the screenshot happens when pkexec falls back to its
-    *textual* authentication agent because no graphical polkit agent is running.
-    We work around this by trying GUI wrappers first and, if all else fails,
-    opening a small xterm so sudo has a real TTY.
-    """
-    base = ["dnf"] + dnf_args
-
-    # 1. pkexec — works when a graphical polkit agent (e.g. polkit-gnome,
-    #    lxqt-policykit, polkit-kde-agent) is running in the session.
-    if _cmd_exists("pkexec"):
-        return ["pkexec"] + base
-
-    # 2. kdesu / kdesudo
-    for wrapper in ("kdesu", "kdesudo"):
-        if _cmd_exists(wrapper):
-            return [wrapper, "-c", " ".join(base)]
-
-    # 3. gksudo / gksu
-    for wrapper in ("gksudo", "gksu"):
-        if _cmd_exists(wrapper):
-            return [wrapper, "--"] + base
-
-    # 4. xterm + sudo as last resort (gives sudo a real TTY)
-    if _cmd_exists("xterm") and _cmd_exists("sudo"):
-        return ["xterm", "-e", "sudo"] + base
-
-    # 5. Bare sudo — will fail without a TTY but at least gives a clear error
-    return ["sudo"] + base
-
-
-def _cmd_exists(name: str) -> bool:
-    """Return True if `name` is found on PATH."""
-    import shutil
-    return shutil.which(name) is not None
+    """Return a command list that runs DNF with root privileges via pkexec."""
+    return ["pkexec"] + ["dnf"] + dnf_args
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +316,7 @@ def dnf_search(query: str) -> list[dict]:
     except Exception:
         pass
 
-    # --- fallback: also try installed packages matching the query ---
+    # --- fallback: installed packages matching the query ---
     try:
         qf = "%{name}\t%{version}-%{release}\t%{repoid}\t%{summary}"
         r = subprocess.run(
@@ -399,6 +440,22 @@ class PackageWorker(threading.Thread):
             self.callback(False, f"Unknown DNF operation: {self.operation}")
             return
 
+        # Ensure a graphical polkit agent is running before calling pkexec.
+        # This is what prevents the "/dev/tty: No such device" error.
+        agent_ok = ensure_polkit_agent()
+        if not agent_ok:
+            self.callback(
+                False,
+                "Could not start a graphical Polkit authentication agent.\n\n"
+                "Please install one of the following and try again:\n"
+                "  • lxqt-policykit  (OpenMandriva/LXQt)\n"
+                "  • polkit-gnome    (GNOME/GTK desktops)\n"
+                "  • polkit-kde-agent-1  (KDE Plasma)\n\n"
+                "You can install the LXQt one with:\n"
+                "  sudo dnf install -y lxqt-policykit"
+            )
+            return
+
         cmd = _build_priv_cmd(dnf_args)
 
         try:
@@ -407,28 +464,14 @@ class PackageWorker(threading.Thread):
                 capture_output=True,
                 text=True,
                 timeout=300,
-                # Ensure no inherited TTY confuses pkexec/sudo
                 stdin=subprocess.DEVNULL,
             )
             if r.returncode == 0:
                 self.callback(True, r.stdout)
             else:
-                # If pkexec failed with the TTY error, give a helpful hint
-                err = r.stderr or r.stdout
-                if "dev/tty" in err or "authentication agent" in err.lower():
-                    err += (
-                        "\n\n— Hint —\n"
-                        "A graphical Polkit authentication agent is required.\n"
-                        "Make sure one of these is running in your session:\n"
-                        "  • polkit-gnome-authentication-agent-1\n"
-                        "  • lxqt-policykit-agent\n"
-                        "  • /usr/lib/polkit-kde-authentication-agent-1\n\n"
-                        "You can start it temporarily by running one of the above "
-                        "commands in a terminal before using FiNDy."
-                    )
-                self.callback(False, err)
+                self.callback(False, r.stderr or r.stdout)
         except FileNotFoundError:
-            self.callback(False, f"Command not found: {cmd[0]}\n\nIs pkexec / sudo installed?")
+            self.callback(False, f"Command not found: {cmd[0]}\n\nIs pkexec installed?")
         except subprocess.TimeoutExpired:
             self.callback(False, "Operation timed out after 5 minutes.")
 
@@ -1211,6 +1254,9 @@ class FiNDyApp(ttk.Window):
         self._build_menu()
         self._build_ui()
         self._schedule_update_check()
+        # Silently pre-launch a polkit agent in the background so it's
+        # ready before the user clicks Install for the first time.
+        threading.Thread(target=ensure_polkit_agent, daemon=True).start()
 
     def _build_menu(self):
         menubar = Menu(self); self.configure(menu=menubar)
