@@ -190,33 +190,39 @@ _ARCH_RE = re.compile(r'\.(x86_64|i686|noarch|aarch64|armv7hl|src)$')
 # ---------------------------------------------------------------------------
 
 # Candidate graphical polkit agents, in preference order.
-# Each entry is the executable name as it appears on PATH.
 _POLKIT_AGENTS = [
     # OpenMandriva / LXQt
+    "lxqt-policykit",
     "lxqt-policykit-agent",
+    "/usr/bin/lxqt-policykit",
+    "/usr/libexec/lxqt-policykit",
+    "/usr/lib/lxqt-policykit/lxqt-policykit",
+    "/usr/lib64/lxqt-policykit/lxqt-policykit",
+    # KDE Plasma
+    "polkit-kde-agent-1",
+    "/usr/lib/polkit-kde-agent-1",
+    "/usr/libexec/polkit-kde-agent-1",
+    "/usr/lib64/polkit-kde-agent-1",
     # GNOME / generic
     "polkit-gnome-authentication-agent-1",
     "/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1",
     "/usr/libexec/polkit-gnome-authentication-agent-1",
-    # KDE
-    "/usr/lib/polkit-kde-authentication-agent-1",
-    "/usr/libexec/polkit-kde-authentication-agent-1",
-    "polkit-kde-authentication-agent-1",
     # XFCE
     "/usr/lib/xfce4/polkit-xfce-authentication-agent-1",
     # MATE
     "/usr/lib/mate-polkit/polkit-mate-authentication-agent-1",
 ]
 
-_polkit_proc: subprocess.Popen | None = None  # our own spawned agent, if any
+_polkit_proc: subprocess.Popen | None = None
 
 
 def _polkit_agent_running() -> bool:
     """Return True if any known polkit agent process is already running."""
     agent_basenames = {
+        "lxqt-policykit",
         "lxqt-policykit-agent",
+        "polkit-kde-agent-1",
         "polkit-gnome-authentication-agent-1",
-        "polkit-kde-authentication-agent-1",
         "polkit-mate-authentication-agent-1",
         "polkit-xfce-authentication-agent-1",
         "xfce-polkit",
@@ -232,12 +238,24 @@ def _polkit_agent_running() -> bool:
         return False
 
 
+def _find_polkit_agent_exe() -> str | None:
+    """Return the path of the first available polkit agent executable, or None."""
+    for agent in _POLKIT_AGENTS:
+        if os.path.isabs(agent):
+            if os.path.isfile(agent) and os.access(agent, os.X_OK):
+                return agent
+        else:
+            found = shutil.which(agent)
+            if found:
+                return found
+    return None
+
+
 def ensure_polkit_agent() -> bool:
     """
     Make sure a graphical polkit agent is running.
-    If one is already running, do nothing and return True.
-    Otherwise try to launch one from _POLKIT_AGENTS.
-    Returns True if an agent is (or was) successfully started.
+    Spawns one with setsid so it gets its own session (no /dev/tty issues).
+    Returns True if an agent is confirmed running.
     """
     global _polkit_proc
 
@@ -249,30 +267,131 @@ def ensure_polkit_agent() -> bool:
     if _polkit_proc is not None and _polkit_proc.poll() is None:
         return True
 
-    # Try to start one
-    for agent in _POLKIT_AGENTS:
-        exe = agent if os.path.isabs(agent) else shutil.which(agent)
-        if not exe or not os.path.isfile(exe):
-            continue
+    exe = _find_polkit_agent_exe()
+    if not exe:
+        return False
+
+    try:
+        # Use setsid so the agent gets its own process group / session,
+        # completely detached from our controlling terminal (avoids /dev/tty errors).
+        _polkit_proc = subprocess.Popen(
+            ["setsid", exe],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        # Give the agent time to register on D-Bus
+        for _ in range(10):
+            time.sleep(0.3)
+            if _polkit_agent_running():
+                return True
+        # Process started — give it a bit more time even if ps hasn't caught up
+        return _polkit_proc.poll() is None
+    except FileNotFoundError:
+        # setsid not available — try without it
         try:
             _polkit_proc = subprocess.Popen(
                 [exe],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,
-                start_new_session=True,
+                close_fds=True,
+                start_new_session=True,   # Python's equivalent of setsid
             )
-            time.sleep(0.6)   # give the agent a moment to register on D-Bus
-            return True
+            time.sleep(1.0)
+            return _polkit_proc.poll() is None
         except Exception:
-            continue
+            return False
+    except Exception:
+        return False
 
-    return False  # nothing worked
+
+def _pkexec_available() -> bool:
+    return shutil.which("pkexec") is not None
 
 
-def _build_priv_cmd(dnf_args: list[str]) -> list[str]:
-    """Return a command list that runs DNF with root privileges via pkexec."""
-    return ["pkexec"] + ["dnf"] + dnf_args
+def _run_privileged_dnf(dnf_args: list[str]) -> tuple[bool, str]:
+    """
+    Run a DNF command with root privileges.
+
+    Strategy:
+      1. Ensure a graphical polkit agent is running, then use pkexec.
+      2. If pkexec is unavailable, fall back to kdesu.
+      3. Last resort: xterm + sudo (opens a visible terminal).
+
+    Returns (success: bool, output: str).
+    """
+    # --- Strategy 1: pkexec (preferred) ---
+    if _pkexec_available():
+        agent_ok = ensure_polkit_agent()
+        if not agent_ok:
+            # Try anyway — the desktop session may have its own agent
+            # registered on D-Bus that ps couldn't see.
+            pass
+
+        cmd = ["pkexec", "--disable-internal-agent", "dnf"] + dnf_args
+        try:
+            r = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                stdin=subprocess.DEVNULL,
+            )
+            if r.returncode == 0:
+                return True, r.stdout
+            stderr = r.stderr or r.stdout
+            # Only fall through to next strategy on auth-agent errors
+            if "authentication agent" not in stderr.lower() and \
+               "no such device" not in stderr.lower():
+                return False, stderr
+            # Otherwise fall through to alternative strategies below
+        except FileNotFoundError:
+            pass
+        except subprocess.TimeoutExpired:
+            return False, "Operation timed out after 5 minutes."
+
+    # --- Strategy 2: kdesu ---
+    if shutil.which("kdesu"):
+        cmd = ["kdesu", "--", "dnf"] + dnf_args
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
+                               stdin=subprocess.DEVNULL)
+            if r.returncode == 0:
+                return True, r.stdout
+            return False, r.stderr or r.stdout
+        except subprocess.TimeoutExpired:
+            return False, "Operation timed out after 5 minutes."
+        except Exception:
+            pass
+
+    # --- Strategy 3: xterm + sudo (last resort) ---
+    if shutil.which("xterm") and shutil.which("sudo"):
+        shell_cmd = "sudo dnf " + " ".join(dnf_args) + \
+                    "; echo; echo '=== Press Enter to close ==='; read _"
+        try:
+            r = subprocess.run(
+                ["xterm", "-e", "bash", "-c", shell_cmd],
+                timeout=300,
+            )
+            # xterm exit code is unreliable; assume success if it didn't crash
+            return r.returncode == 0, "Operation completed via xterm."
+        except subprocess.TimeoutExpired:
+            return False, "Operation timed out after 5 minutes."
+        except Exception as e:
+            pass
+
+    return False, (
+        "Could not find a way to run DNF with elevated privileges.\n\n"
+        "Please install a graphical Polkit authentication agent:\n"
+        "  • lxqt-policykit  (OpenMandriva/LXQt)\n"
+        "      sudo dnf install -y lxqt-policykit\n"
+        "  • polkit-kde-agent-1  (KDE Plasma)\n"
+        "      sudo dnf install -y polkit-kde-agent-1\n"
+        "  • polkit-gnome  (GNOME/GTK desktops)\n"
+        "      sudo dnf install -y polkit-gnome"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -440,40 +559,8 @@ class PackageWorker(threading.Thread):
             self.callback(False, f"Unknown DNF operation: {self.operation}")
             return
 
-        # Ensure a graphical polkit agent is running before calling pkexec.
-        # This is what prevents the "/dev/tty: No such device" error.
-        agent_ok = ensure_polkit_agent()
-        if not agent_ok:
-            self.callback(
-                False,
-                "Could not start a graphical Polkit authentication agent.\n\n"
-                "Please install one of the following and try again:\n"
-                "  • lxqt-policykit  (OpenMandriva/LXQt)\n"
-                "  • polkit-gnome    (GNOME/GTK desktops)\n"
-                "  • polkit-kde-agent-1  (KDE Plasma)\n\n"
-                "You can install the LXQt one with:\n"
-                "  sudo dnf install -y lxqt-policykit"
-            )
-            return
-
-        cmd = _build_priv_cmd(dnf_args)
-
-        try:
-            r = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=300,
-                stdin=subprocess.DEVNULL,
-            )
-            if r.returncode == 0:
-                self.callback(True, r.stdout)
-            else:
-                self.callback(False, r.stderr or r.stdout)
-        except FileNotFoundError:
-            self.callback(False, f"Command not found: {cmd[0]}\n\nIs pkexec installed?")
-        except subprocess.TimeoutExpired:
-            self.callback(False, "Operation timed out after 5 minutes.")
+        success, output = _run_privileged_dnf(dnf_args)
+        self.callback(success, output)
 
     def _run_flatpak(self):
         app_id = self.package_name
@@ -1244,117 +1331,127 @@ class FiNDyApp(ttk.Window):
     def __init__(self):
         self.settings = load_settings()
         super().__init__(themename=self.settings.get("theme", "darkly"))
+        self.title("FiNDy – OpenMandriva Package Manager")
+        self.geometry("1000x650")
         self.edition = detect_omv_edition()
-        display_ed   = _display_edition(self.edition)
-        self.title(f"FiNDy — OpenMandriva {display_ed}")
-        self.geometry("1000x680")
-        self.minsize(800, 500)
         self.tray = TrayManager(self)
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._build_menu()
-        self._build_ui()
-        self._schedule_update_check()
-        # Silently pre-launch a polkit agent in the background so it's
-        # ready before the user clicks Install for the first time.
+        self.update_checker = None
+        self.init_ui()
+        # Start polkit agent early so it's ready before the user clicks anything
         threading.Thread(target=ensure_polkit_agent, daemon=True).start()
+        self.schedule_update_check()
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-    def _build_menu(self):
-        menubar = Menu(self); self.configure(menu=menubar)
-        file_menu = Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="File", menu=file_menu)
-        file_menu.add_command(label="Refresh Repos/Mirrors", command=self._refresh_repos)
-        file_menu.add_command(label="Repo Selector…",        command=launch_repo_selector)
+    def init_ui(self):
+        menu = Menu(self)
+        self.config(menu=menu)
+        file_menu = Menu(menu, tearoff=False)
+        menu.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Settings", command=self.show_settings)
+        file_menu.add_command(label="Refresh Repos", command=self.refresh_repos_bg)
         file_menu.add_separator()
-        file_menu.add_command(label="Settings…", command=self._open_settings)
-        file_menu.add_separator()
-        file_menu.add_command(label="Quit", command=self.quit)
-        help_menu = Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Help", menu=help_menu)
-        help_menu.add_command(label="About FiNDy", command=self._about)
+        file_menu.add_command(label="Exit", command=self.on_closing)
 
-    def _build_ui(self):
-        header = ttk.Frame(self, bootstyle=DARK)
-        header.pack(fill=X)
-        ttk.Label(header, text=f" FiNDy | OpenMandriva {_display_edition(self.edition)}",
-                  font=("", 13, "bold"), bootstyle=INVERSE+DARK).pack(side=LEFT, pady=6, padx=6)
-        self.progress = ttk.Progressbar(header, mode="indeterminate", length=180, bootstyle=INFO)
-        self.progress.pack(side=RIGHT, padx=10, pady=8)
-        self.progress_label = ttk.Label(header, text="", bootstyle=INVERSE+DARK)
-        self.progress_label.pack(side=RIGHT, padx=4)
+        help_menu = Menu(menu, tearoff=False)
+        menu.add_cascade(label="Help", menu=help_menu)
+        help_menu.add_command(label="About", command=self.show_about)
+
+        header = ttk.Frame(self)
+        header.pack(fill=X, padx=10, pady=8)
+        ttk.Label(header, text=f"FiNDy – OpenMandriva {_display_edition(self.edition)} Package Manager",
+                  font=("", 16, "bold")).pack(side=LEFT)
+        self.progress_var = DoubleVar()
+        self.progress = ttk.Progressbar(header, variable=self.progress_var, mode="indeterminate")
+        self.progress.pack(side=RIGHT, fill=X, expand=True, padx=(20, 0))
 
         self.nb = ttk.Notebook(self)
-        self.nb.pack(fill=BOTH, expand=True, padx=6, pady=6)
-        self.dnf_tab      = DNFTab(self.nb, self)
-        self.flatpak_tab  = FlatpakTab(self.nb, self)
+        self.nb.pack(fill=BOTH, expand=True, padx=10, pady=5)
+
+        self.dnf_tab = DNFTab(self.nb, self)
+        self.nb.add(self.dnf_tab, text="DNF Packages")
+
+        self.flatpak_tab = FlatpakTab(self.nb, self)
+        self.nb.add(self.flatpak_tab, text="Flatpaks")
+
         self.appimage_tab = AppImageTab(self.nb, self)
-        self.updates_tab  = UpdatesTab(self.nb, self)
-        self.nb.add(self.dnf_tab,      text=" DNF ")
-        self.nb.add(self.flatpak_tab,  text=" Flatpak ")
-        self.nb.add(self.appimage_tab, text=" AppImages ")
-        self.nb.add(self.updates_tab,  text=" Updates ")
-        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        self.nb.add(self.appimage_tab, text="AppImages")
 
-        self.statusbar_var = StringVar(value="Ready.")
-        ttk.Label(self, textvariable=self.statusbar_var, relief=SUNKEN,
-                  anchor=W, padding=(6, 2)).pack(fill=X, side=BOTTOM)
+        self.updates_tab = UpdatesTab(self.nb, self)
+        self.nb.add(self.updates_tab, text="Updates")
 
-    def _on_tab_changed(self, event):
-        if self.nb.select() == str(self.dnf_tab):
+        self.nb.bind("<<NotebookTabChanged>>", self.on_tab_changed)
+
+    def on_tab_changed(self, event):
+        tab_index = self.nb.index(self.nb.select())
+        if tab_index == 0:
             self.dnf_tab.on_tab_selected()
 
-    def start_progress(self, label="Working…"):
-        self.progress_label.configure(text=label)
-        self.progress.start(10)
-        self.statusbar_var.set(label)
+    def schedule_update_check(self):
+        interval = self.settings.get("interval_minutes", 15) * 60000
+        self.after(interval, self.check_updates_bg)
+
+    def check_updates_bg(self):
+        self.start_progress("Checking for updates…")
+        self.update_checker = UpdateChecker(self.on_updates_checked)
+        self.update_checker.start()
+
+    def on_updates_checked(self, updates):
+        self.after(0, lambda: self.stop_progress())
+        if self.settings.get("notifications", True):
+            total = sum(len(v) for v in updates.values())
+            if total > 0:
+                self.show_notification(f"{total} update(s) available", "FiNDy")
+        self.schedule_update_check()
+
+    def show_notification(self, message, title="FiNDy"):
+        try:
+            subprocess.run(["notify-send", title, message], timeout=5)
+        except Exception:
+            pass
+
+    def refresh_repos_bg(self):
+        self.start_progress("Refreshing repositories…")
+        threading.Thread(target=lambda: self.after(0, lambda: (refresh_repos(), self.stop_progress())),
+                         daemon=True).start()
+
+    def show_settings(self):
+        SettingsDialog(self, self.settings, self.on_settings_saved)
+
+    def on_settings_saved(self, new_settings):
+        self.settings = new_settings
+        self.set_theme(new_settings.get("theme", "darkly"))
+        if new_settings.get("minimize_to_tray", True) and TRAY_AVAILABLE:
+            self.tray.show()
+        else:
+            self.tray.hide()
+        self.schedule_update_check()
+
+    def set_theme(self, theme_name):
+        self.tk.call("ttk::style", "theme", "use", theme_name)
+
+    def show_about(self):
+        messagebox.showinfo("About FiNDy",
+            "FiNDy – Fast, Intelligent DNF\n\n"
+            "Modern Tkinter-based GUI for managing DNF packages,\n"
+            "Flatpaks, and AppImages on OpenMandriva Lx.\n\n"
+            "Supports: Cooker, ROME, Rock (auto-detected)\n\n"
+            "© 2024 OpenMandriva Community")
+
+    def start_progress(self, message=""):
+        self.progress_var.set(0)
+        self.progress.start()
 
     def stop_progress(self):
         self.progress.stop()
-        self.progress_label.configure(text="")
-        self.statusbar_var.set("Ready.")
+        self.progress_var.set(0)
 
-    def _refresh_repos(self):
-        self.start_progress("Refreshing repos…")
-        threading.Thread(target=lambda: (refresh_repos(), self.after(0, self.stop_progress)),
-                         daemon=True).start()
-
-    def _open_settings(self):
-        SettingsDialog(self, self.settings, self._apply_settings)
-
-    def _apply_settings(self, new_settings):
-        self.settings = new_settings
-        try:
-            self.style.theme_use(new_settings.get("theme", "darkly"))
-        except Exception:
-            pass
-        self._schedule_update_check()
-
-    def _schedule_update_check(self):
-        self.after(self.settings.get("interval_minutes", 15) * 60000, self._auto_check_updates)
-
-    def _auto_check_updates(self):
-        UpdateChecker(self._notify_updates).start()
-        self._schedule_update_check()
-
-    def _notify_updates(self, updates):
-        total = sum(len(v) for v in updates.values())
-        if total > 0 and self.settings.get("notifications", True):
-            self.after(0, lambda: self.statusbar_var.set(
-                f"{total} update(s) available — check the Updates tab."))
-
-    def _about(self):
-        messagebox.showinfo("About FiNDy",
-            "FiNDy Package Manager\n"
-            "Fast, Intelligent package management for OpenMandriva Lx\n\n"
-            "• DNF packages\n• Flatpak apps\n• AppImages (via GearLever)\n\n"
-            "Detects edition automatically (Cooker / ROME / Rock).")
-
-    def _on_close(self):
-        if TRAY_AVAILABLE and self.settings.get("minimize_to_tray", True):
-            self.withdraw(); self.tray.show()
+    def on_closing(self):
+        if self.settings.get("minimize_to_tray", True) and TRAY_AVAILABLE:
+            self.tray.show()
+            self.withdraw()
         else:
             self.quit()
 
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     app = FiNDyApp()
     app.mainloop()
