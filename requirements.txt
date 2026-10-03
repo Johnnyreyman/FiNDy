@@ -1,1 +1,5 @@
 ttkbootstrap>=1.10.0
+
+# Optional: system tray icon support
+# pystray>=0.19
+# Pillow>=9.0

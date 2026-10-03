@@ -98,7 +98,7 @@ fi
 # 6. Executable + Desktop entry
 # ─────────────────────────────────────────────
 
-SCRIPT_DIR="$(pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MAIN_SCRIPT="$SCRIPT_DIR/findy_tk.py"
 
 if [[ ! -f "$MAIN_SCRIPT" ]]; then
