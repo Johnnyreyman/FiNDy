@@ -1314,15 +1314,44 @@ class SyncTab(ttk.Frame):
                 installed = self._get_installed_dnf_names()
                 to_install = [p for p in dnf_pkgs if p not in installed]
                 if to_install:
-                    batch_size = 50
-                    for i in range(0, len(to_install), batch_size):
-                        batch = to_install[i:i + batch_size]
-                        success, output = _run_privileged_dnf(["install", "-y"] + batch)
-                        if success:
-                            results["dnf_installed"] += len(batch)
+                    # Run ALL DNF installs under a SINGLE pkexec to avoid multiple password prompts
+                    tmp_script = "/tmp/findy_dnf_restore.sh"
+                    try:
+                        with open(tmp_script, "w") as f:
+                            f.write("#!/bin/bash\n")
+                            f.write("set -e\n")
+                            batch_size = 50
+                            for i in range(0, len(to_install), batch_size):
+                                batch = to_install[i:i + batch_size]
+                                f.write("dnf install -y " + " ".join(batch) + "\n")
+                        os.chmod(tmp_script, 0o755)
+                        if _pkexec_available():
+                            agent_ok = ensure_polkit_agent()
+                            cmd = ["pkexec", "--disable-internal-agent", "bash", tmp_script]
+                            try:
+                                r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, stdin=subprocess.DEVNULL)
+                                if r.returncode == 0:
+                                    results["dnf_installed"] += len(to_install)
+                                else:
+                                    results["dnf_failed"] += len(to_install)
+                                    results["errors"].append(f"DNF restore failed: {(r.stderr or r.stdout)[:200]}")
+                            except subprocess.TimeoutExpired:
+                                results["dnf_failed"] += len(to_install)
+                                results["errors"].append("DNF restore timed out")
+                            except Exception as e:
+                                results["dnf_failed"] += len(to_install)
+                                results["errors"].append(f"DNF restore error: {str(e)[:200]}")
                         else:
-                            results["dnf_failed"] += len(batch)
-                            results["errors"].append(f"DNF batch failed: {output[:200]}")
+                            results["dnf_failed"] += len(to_install)
+                            results["errors"].append("pkexec not available for DNF restore")
+                    except Exception as e:
+                        results["dnf_failed"] += len(to_install)
+                        results["errors"].append(f"DNF restore error: {str(e)[:200]}")
+                    finally:
+                        try:
+                            os.unlink(tmp_script)
+                        except:
+                            pass
 
             scope = self.restore_scope_var.get()
             for fp in flat_pkgs:
