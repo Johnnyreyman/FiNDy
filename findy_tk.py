@@ -538,7 +538,8 @@ class PackageWorker(threading.Thread):
                     if self.operation == "remove":
                         remove_flatpak_scope(app_id)
                     else:
-                        save_flatpak_scope(app_id, scope_flag.lstrip("--"))
+                        if not ("/" in app_id or "\\" in app_id or app_id.endswith((".flatpak", ".flatpakref"))):
+                            save_flatpak_scope(app_id, scope_flag.lstrip("--"))
                     self.callback(True, r.stdout or "Done.")
                     return
             except Exception:
@@ -769,6 +770,7 @@ class FlatpakTab(ttk.Frame):
         ttk.Button(btn_frame, text="Install", command=lambda: self.flat_action("install"), bootstyle=SUCCESS).pack(side=LEFT, padx=5)
         ttk.Button(btn_frame, text="Remove", command=lambda: self.flat_action("remove"), bootstyle=DANGER).pack(side=LEFT, padx=5)
         ttk.Button(btn_frame, text="Update", command=lambda: self.flat_action("update"), bootstyle=WARNING).pack(side=LEFT, padx=5)
+        ttk.Button(btn_frame, text="Install from File", command=self.install_from_file, bootstyle=INFO).pack(side=LEFT, padx=5)
 
         self.status_var = StringVar(value="Ready.")
         ttk.Label(self, textvariable=self.status_var, anchor=W).pack(fill=X, padx=10, pady=(0, 5))
@@ -854,13 +856,19 @@ class FlatpakTab(ttk.Frame):
         w = PackageWorker(action, "flatpak", app_id, self.on_action_finished)
         w.start()
 
-    def _show_scope_dialog(self, app_id):
+    def install_from_file(self):
+        path = filedialog.askopenfilename(title="Select Flatpak file to install", filetypes=[("Flatpak", "*.flatpak *.flatpakref"), ("All files", "*")])
+        if not path: return
+        self._show_scope_dialog(path)
+
+    def _show_scope_dialog(self, target):
         dlg = Toplevel(self)
         dlg.title("Choose Install Scope")
         dlg.resizable(False, False)
         dlg.transient(self.main_app)
         dlg.grab_set()
-        ttk.Label(dlg, text=f"How would you like to install\n{app_id}?", font=("", 12), anchor=CENTER, justify=CENTER).pack(padx=24, pady=(20, 8))
+        display = os.path.basename(target) if ("/" in target or "\\" in target or target.endswith((".flatpak", ".flatpakref"))) else target
+        ttk.Label(dlg, text=f"How would you like to install\n{display}?", font=("", 12), anchor=CENTER, justify=CENTER).pack(padx=24, pady=(20, 8))
         choice_var = StringVar(value="system")
         rb_frame = ttk.Frame(dlg)
         rb_frame.pack(padx=32, pady=8, anchor=W)
@@ -871,8 +879,8 @@ class FlatpakTab(ttk.Frame):
         def proceed():
             scope = choice_var.get()
             dlg.destroy()
-            self.main_app.start_progress(f"Installing {app_id}…")
-            w = PackageWorker("install", "flatpak", app_id, self.on_action_finished)
+            self.main_app.start_progress(f"Installing {display}…")
+            w = PackageWorker("install", "flatpak", target, self.on_action_finished)
             w.scope = scope
             w.start()
         ttk.Button(btn_frame, text="Install", command=proceed, bootstyle=SUCCESS, width=12).pack(side=LEFT, padx=8)
@@ -1308,20 +1316,19 @@ class SyncTab(ttk.Frame):
         self.main_app.start_progress("Restoring packages…")
 
         def _restore():
-            results = {"dnf_installed": 0, "dnf_failed": 0, "flatpak_installed": 0, "flatpak_failed": 0, "errors": []}
+            results = {"dnf_installed": 0, "dnf_failed": 0, "flatpak_installed": 0, "flatpak_failed": 0, "errors": [], "had_dnf": bool(dnf_pkgs), "had_flatpak": bool(flat_pkgs)}
 
             if dnf_pkgs:
                 installed = self._get_installed_dnf_names()
                 to_install = [p for p in dnf_pkgs if p not in installed]
                 if to_install:
                     # SINGLE pkexec prompt for the entire DNF restore.
-                    # Use a temp script with small batches so we avoid argument list too long,
-                    # and continue even if individual batches fail.
+                    # Use a temp script with small batches (avoids arg list too long).
                     tmp_script = "/tmp/findy_dnf_restore.sh"
                     try:
                         with open(tmp_script, "w") as f:
                             f.write("#!/bin/bash\n")
-                            f.write("set +e\n")  # do not stop on first failed dnf
+                            f.write("set +e\n")
                             batch_size = 50
                             for i in range(0, len(to_install), batch_size):
                                 batch = to_install[i:i + batch_size]
@@ -1331,22 +1338,12 @@ class SyncTab(ttk.Frame):
                         if _pkexec_available():
                             agent_ok = ensure_polkit_agent()
                             cmd = ["pkexec", "--disable-internal-agent", "bash", tmp_script]
-                            try:
-                                r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, stdin=subprocess.DEVNULL)
-                                # Since we use || true, the script usually exits 0 even with some failures.
-                                # We will count actual success by re-checking installed packages below.
-                                pass
-                            except subprocess.TimeoutExpired:
-                                results["dnf_failed"] += len(to_install)
-                                results["errors"].append("DNF restore timed out")
-                            except Exception as e:
-                                results["dnf_failed"] += len(to_install)
-                                results["errors"].append(f"DNF restore error: {str(e)[:200]}")
+                            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, stdin=subprocess.DEVNULL)
+                            if r.returncode != 0:
+                                results["errors"].append(f"DNF script exit code {r.returncode}: {(r.stderr or r.stdout)[:150]}")
                         else:
-                            results["dnf_failed"] += len(to_install)
                             results["errors"].append("pkexec not available for DNF restore")
                     except Exception as e:
-                        results["dnf_failed"] += len(to_install)
                         results["errors"].append(f"DNF restore error: {str(e)[:200]}")
                     finally:
                         try:
@@ -1354,14 +1351,13 @@ class SyncTab(ttk.Frame):
                         except:
                             pass
 
-                    # Re-check how many are actually installed now (more accurate than assuming all succeeded)
+                    # Always re-check with rpm (direct & reliable) to get accurate installed count.
                     try:
                         now_installed = self._get_installed_dnf_names()
                         newly_installed = [p for p in to_install if p in now_installed]
                         results["dnf_installed"] = len(newly_installed)
                         results["dnf_failed"] = len(to_install) - len(newly_installed)
-                    except:
-                        # fallback: assume nothing installed if check fails
+                    except Exception:
                         if results["dnf_installed"] == 0:
                             results["dnf_failed"] = len(to_install)
 
@@ -1386,8 +1382,8 @@ class SyncTab(ttk.Frame):
 
     def _get_installed_dnf_names(self) -> set:
         try:
-            r = subprocess.run(["dnf", "repoquery", "--queryformat", "%{name}", "--installed"],
-                               capture_output=True, text=True, timeout=60)
+            r = subprocess.run(["rpm", "-qa", "--queryformat", "%{NAME}\n"],
+                               capture_output=True, text=True, timeout=30)
             return {line.strip() for line in r.stdout.splitlines() if line.strip()}
         except Exception:
             return set()
@@ -1395,9 +1391,9 @@ class SyncTab(ttk.Frame):
     def _restore_done(self, results):
         self.main_app.stop_progress()
         msg_parts = []
-        if results["dnf_installed"] or results["dnf_failed"]:
+        if results.get("had_dnf"):
             msg_parts.append(f"DNF: {results['dnf_installed']} installed, {results['dnf_failed']} failed")
-        if results["flatpak_installed"] or results["flatpak_failed"]:
+        if results.get("had_flatpak"):
             msg_parts.append(f"Flatpak: {results['flatpak_installed']} installed, {results['flatpak_failed']} failed")
         if not msg_parts:
             msg_parts.append("No packages needed restoring (all already installed).")
